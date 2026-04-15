@@ -96,4 +96,5 @@ export const transitionInvoice = (
       )
 
 export const isOverdue = (invoice: Invoice, now: Date) =>
-  invoice.status !== "paid" && invoice.dueDate.getTime() < now.getTime()
+  invoice.status !== "paid" &&
+  now.getTime() >= invoice.dueDate.getTime() + 24 * 60 * 60 * 1000

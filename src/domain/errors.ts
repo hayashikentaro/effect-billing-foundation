@@ -15,6 +15,16 @@ export class EntityNotFoundError extends Data.TaggedError("EntityNotFoundError")
   readonly id: string
 }> {}
 
+export class TenantBoundaryViolationError extends Data.TaggedError(
+  "TenantBoundaryViolationError"
+)<{
+  readonly invoiceId: string
+  readonly requestedTenantId: string
+  readonly actualTenantId: string
+  readonly step: string
+  readonly detail: string
+}> {}
+
 export class InfrastructureError extends Data.TaggedError("InfrastructureError")<{
   readonly service: string
   readonly operation: string
@@ -26,6 +36,7 @@ export type AppError =
   | InputValidationError
   | RuleViolationError
   | EntityNotFoundError
+  | TenantBoundaryViolationError
   | InfrastructureError
 
 export const toInfrastructureError = (

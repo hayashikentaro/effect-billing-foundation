@@ -39,6 +39,13 @@ export type WorkflowEvent =
       readonly status: InvoiceStatus
     })
   | (EventBase & {
+      readonly type: "TenantBoundaryViolation"
+      readonly invoiceId: string
+      readonly requestedTenantId: string
+      readonly actualTenantId: string
+      readonly step: string
+    })
+  | (EventBase & {
       readonly type: "WorkflowFailed"
       readonly step: string
       readonly invoiceId?: string

@@ -1,5 +1,6 @@
 import { Effect, pipe } from "effect"
 import { createInvoice, isOverdue, transitionInvoice } from "../domain/invoice.js"
+import type { Invoice } from "../domain/invoice.js"
 import { totalPaidAmount, type Payment } from "../domain/payment.js"
 import type { WorkflowEvent } from "../domain/workflow-event.js"
 import { AiGateway } from "../services/ai-gateway.js"
@@ -9,6 +10,7 @@ import { MailGateway } from "../services/mail-gateway.js"
 import { PaymentGateway } from "../services/payment-gateway.js"
 import { WorkflowLogger } from "../services/workflow-logger.js"
 import type { CustomerInvoiceImporter } from "../adapters/customers/customer-invoice-importer.js"
+import { TenantBoundaryViolationError } from "../domain/errors.js"
 
 const withRetries = <A, E>(
   makeEffect: () => Effect.Effect<A, E>,
@@ -20,6 +22,9 @@ const withRetries = <A, E>(
       retries > 0 ? withRetries(makeEffect, retries - 1) : Effect.fail(error)
     )
   )
+
+const formatError = (error: unknown) =>
+  error instanceof Error ? error.message : String(error)
 
 const recordFailure = (
   event: Omit<Extract<WorkflowEvent, { type: "WorkflowFailed" }>, "type" | "at">
@@ -37,7 +42,7 @@ const recordFailure = (
   })
 
 const saveWithStatus = (
-  invoiceId: string,
+  invoice: Invoice,
   nextStatus: "sent" | "paid" | "overdue" | "reminded",
   eventFactory: (at: Date) => WorkflowEvent
 ) =>
@@ -45,7 +50,6 @@ const saveWithStatus = (
     const repo = yield* InvoiceRepo
     const logger = yield* WorkflowLogger
     const clock = yield* Clock
-    const invoice = yield* repo.findById(invoiceId)
     const updated = yield* transitionInvoice(invoice, nextStatus)
     const at = yield* clock.now
 
@@ -54,6 +58,50 @@ const saveWithStatus = (
 
     return updated
   })
+
+const loadInvoiceForTenant = (params: {
+  readonly invoiceId: string
+  readonly tenantId: string
+  readonly step: string
+}) =>
+  Effect.gen(function* () {
+    const repo = yield* InvoiceRepo
+    const logger = yield* WorkflowLogger
+    const clock = yield* Clock
+    const invoice = yield* repo.findById(params.invoiceId)
+
+    if (invoice.tenantId === params.tenantId) {
+      return invoice
+    }
+
+    const at = yield* clock.now
+
+    yield* logger.record({
+      type: "TenantBoundaryViolation",
+      at,
+      tenantId: invoice.tenantId,
+      invoiceId: invoice.id,
+      requestedTenantId: params.tenantId,
+      actualTenantId: invoice.tenantId,
+      step: params.step
+    })
+
+    return yield* Effect.fail(
+      new TenantBoundaryViolationError({
+        invoiceId: invoice.id,
+        requestedTenantId: params.tenantId,
+        actualTenantId: invoice.tenantId,
+        step: params.step,
+        detail: `Invoice ${invoice.id} belongs to tenant ${invoice.tenantId}, not ${params.tenantId}`
+      })
+    )
+  })
+
+// "created" means imported but not yet delivered, so collections must skip it.
+const isReminderEligible = (invoice: Invoice) =>
+  invoice.status === "sent" ||
+  invoice.status === "overdue" ||
+  invoice.status === "reminded"
 
 export const importAndSendInvoices = (params: {
   readonly tenantId: string
@@ -68,46 +116,53 @@ export const importAndSendInvoices = (params: {
     const normalizedRows = yield* params.importer.decodeCsv(params.csvText)
 
     return yield* Effect.forEach(normalizedRows, (normalizedRow) =>
-      Effect.gen(function* () {
-        const at = yield* clock.now
+      {
+        let invoiceId: string | undefined
 
-        yield* logger.record({
-          type: "InvoiceImported",
-          at,
-          tenantId: params.tenantId,
-          importerId: normalizedRow.importerId,
-          externalRef: normalizedRow.externalRef,
-          rowNumber: normalizedRow.rowNumber
-        })
+        return Effect.gen(function* () {
+          const at = yield* clock.now
 
-        const invoice = yield* createInvoice(params.tenantId, normalizedRow, at)
-        yield* repo.save(invoice)
-        yield* logger.record({
-          type: "InvoiceCreated",
-          at,
-          tenantId: params.tenantId,
-          invoiceId: invoice.id,
-          status: invoice.status
-        })
-
-        yield* withRetries(() => mail.sendInvoice(invoice))
-
-        return yield* saveWithStatus(invoice.id, "sent", (sentAt) => ({
-          type: "InvoiceSent",
-          at: sentAt,
-          tenantId: params.tenantId,
-          invoiceId: invoice.id,
-          status: "sent"
-        }))
-      }).pipe(
-        Effect.tapError((error) =>
-          recordFailure({
+          yield* logger.record({
+            type: "InvoiceImported",
+            at,
             tenantId: params.tenantId,
-            step: "importAndSendInvoices",
-            detail: String(error)
+            importerId: normalizedRow.importerId,
+            externalRef: normalizedRow.externalRef,
+            rowNumber: normalizedRow.rowNumber
           })
+
+          const invoice = yield* createInvoice(params.tenantId, normalizedRow, at)
+          invoiceId = invoice.id
+
+          yield* repo.save(invoice)
+          yield* logger.record({
+            type: "InvoiceCreated",
+            at,
+            tenantId: invoice.tenantId,
+            invoiceId: invoice.id,
+            status: invoice.status
+          })
+
+          yield* withRetries(() => mail.sendInvoice(invoice))
+
+          return yield* saveWithStatus(invoice, "sent", (sentAt) => ({
+            type: "InvoiceSent",
+            at: sentAt,
+            tenantId: invoice.tenantId,
+            invoiceId: invoice.id,
+            status: "sent"
+          }))
+        }).pipe(
+          Effect.tapError((error) =>
+            recordFailure({
+              tenantId: params.tenantId,
+              step: "importAndSendInvoices",
+              invoiceId,
+              detail: formatError(error)
+            })
+          )
         )
-      )
+      }
     )
   })
 
@@ -116,9 +171,12 @@ export const confirmPayment = (params: {
   readonly invoiceId: string
 }) =>
   Effect.gen(function* () {
-    const repo = yield* InvoiceRepo
     const paymentGateway = yield* PaymentGateway
-    const invoice = yield* repo.findById(params.invoiceId)
+    const invoice = yield* loadInvoiceForTenant({
+      tenantId: params.tenantId,
+      invoiceId: params.invoiceId,
+      step: "confirmPayment"
+    })
     const payments = yield* withRetries(() => paymentGateway.findPayments(invoice.id))
 
     if (totalPaidAmount(payments) < invoice.amount || invoice.status === "paid") {
@@ -129,10 +187,10 @@ export const confirmPayment = (params: {
       }
     }
 
-    const updated = yield* saveWithStatus(invoice.id, "paid", (at) => ({
+    const updated = yield* saveWithStatus(invoice, "paid", (at) => ({
       type: "PaymentConfirmed",
       at,
-      tenantId: params.tenantId,
+      tenantId: invoice.tenantId,
       invoiceId: invoice.id,
       paymentIds: payments.map((payment) => payment.id),
       status: "paid"
@@ -145,12 +203,14 @@ export const confirmPayment = (params: {
     }
   }).pipe(
     Effect.tapError((error) =>
-      recordFailure({
-        tenantId: params.tenantId,
-        step: "confirmPayment",
-        invoiceId: params.invoiceId,
-        detail: String(error)
-      })
+      error instanceof TenantBoundaryViolationError
+        ? Effect.void
+        : recordFailure({
+            tenantId: params.tenantId,
+            step: "confirmPayment",
+            invoiceId: params.invoiceId,
+            detail: formatError(error)
+          })
     )
   )
 
@@ -165,24 +225,32 @@ export const sendReminderIfOverdue = (params: {
   readonly invoiceId: string
 }) =>
   Effect.gen(function* () {
-    const repo = yield* InvoiceRepo
     const ai = yield* AiGateway
     const mail = yield* MailGateway
     const clock = yield* Clock
-    const invoice = yield* repo.findById(params.invoiceId)
+    const invoice = yield* loadInvoiceForTenant({
+      tenantId: params.tenantId,
+      invoiceId: params.invoiceId,
+      step: "sendReminderIfOverdue"
+    })
+
+    if (!isReminderEligible(invoice) || invoice.status === "paid") {
+      return { reminded: false }
+    }
+
     const now = yield* clock.now
 
-    if (!isOverdue(invoice, now) || invoice.status === "paid") {
+    if (!isOverdue(invoice, now)) {
       return { reminded: false }
     }
 
     const overdueInvoice =
       invoice.status === "overdue" || invoice.status === "reminded"
         ? invoice
-        : yield* saveWithStatus(invoice.id, "overdue", (at) => ({
+        : yield* saveWithStatus(invoice, "overdue", (at) => ({
             type: "InvoiceOverdue",
             at,
-            tenantId: params.tenantId,
+            tenantId: invoice.tenantId,
             invoiceId: invoice.id,
             status: "overdue"
           }))
@@ -193,10 +261,10 @@ export const sendReminderIfOverdue = (params: {
 
     const draft = yield* withRetries(() => ai.draftReminder(overdueInvoice))
     yield* withRetries(() => mail.sendReminder(overdueInvoice, draft))
-    yield* saveWithStatus(overdueInvoice.id, "reminded", (at) => ({
+    yield* saveWithStatus(overdueInvoice, "reminded", (at) => ({
       type: "ReminderSent",
       at,
-      tenantId: params.tenantId,
+      tenantId: overdueInvoice.tenantId,
       invoiceId: overdueInvoice.id,
       status: "reminded"
     }))
@@ -204,11 +272,13 @@ export const sendReminderIfOverdue = (params: {
     return { reminded: true }
   }).pipe(
     Effect.tapError((error) =>
-      recordFailure({
-        tenantId: params.tenantId,
-        step: "sendReminderIfOverdue",
-        invoiceId: params.invoiceId,
-        detail: String(error)
-      })
+      error instanceof TenantBoundaryViolationError
+        ? Effect.void
+        : recordFailure({
+            tenantId: params.tenantId,
+            step: "sendReminderIfOverdue",
+            invoiceId: params.invoiceId,
+            detail: formatError(error)
+          })
     )
   )
